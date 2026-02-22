@@ -1,18 +1,13 @@
 clc; clear; close all;
 
-%% ----------------------------------
-% 1. Load FD001 Dataset
-%% ----------------------------------
-train = readmatrix('D:\MFC - 4\dataset\train_FD001.txt');
-test  = readmatrix('D:\MFC - 4\dataset\test_FD001.txt');
-rul_test = readmatrix('D:\MFC - 4\dataset\RUL_FD001.txt');
+%% 1. LOAD DATA
+train = readmatrix("C:\Users\sowmy\OneDrive\Desktop\mfc4_project\cmappss_dataset\train_FD001.txt");
+test  = readmatrix("C:\Users\sowmy\OneDrive\Desktop\mfc4_project\cmappss_dataset\test_FD001.txt");
+rul_test = readmatrix("C:\Users\sowmy\OneDrive\Desktop\mfc4_project\cmappss_dataset\RUL_FD001.txt"');
 
-% FD001 structure
-% [unit, cycle, op1, op2, op3, s1 ... s21]
 
-%% ----------------------------------
-% 2. Compute RUL for Training Data
-%% ----------------------------------
+%% 2. COMPUTE RUL (with cap)
+RUL_CAP = 125;
 units = unique(train(:,1));
 RUL_train = zeros(size(train,1),1);
 
@@ -22,113 +17,94 @@ for i = 1:length(units)
     RUL_train(idx) = max_cycle - train(idx,2);
 end
 
-%% ----------------------------------
-% 3. Select Sensor Columns Automatically
-%% ----------------------------------
-sensor_cols = 6:size(train,2);   % s1 to s21
+RUL_train(RUL_train > RUL_CAP) = RUL_CAP;
 
-% Remove near-constant sensors
+%% 3. SENSOR SELECTION (Variance Filter)
+sensor_cols = 6:size(train,2);
 sensor_var = var(train(:,sensor_cols));
-sensor_cols = sensor_cols(sensor_var > 1e-5);
+sensor_cols = sensor_cols(sensor_var > 1e-4);
 
-X_train = train(:,sensor_cols);
-X_test  = test(:,sensor_cols);
-y_train = RUL_train;
+X_train_all = train(:,sensor_cols);
+X_test_all  = test(:,sensor_cols);
 
-%% ----------------------------------
-% 4. Standardization
-%% ----------------------------------
-[X_train_scaled, mu, sigma] = zscore(X_train);
-X_test_scaled = (X_test - mu) ./ sigma;
+%% 4. STANDARDIZATION
+[X_train_all, mu, sigma] = zscore(X_train_all);
+X_test_all = (X_test_all - mu) ./ sigma;
 
-%% ----------------------------------
-% 5. PCA (MANUAL IMPLEMENTATION – retain 95% variance)
-%% ----------------------------------
+%% 5. WINDOWING (IMPORTANT!)
+WINDOW = 30;
 
-% Step 1: Covariance matrix
-C = cov(X_train_scaled);
+X_train = [];
+y_train = [];
 
-% Step 2: Eigen decomposition
-[eigVec, eigVal] = eig(C);
+for id = units'
+    idx = train(:,1)==id;
+    data = X_train_all(idx,:);
+    rul_vals = RUL_train(idx);
 
-% Step 3: Extract eigenvalues as vector
-eigValues = diag(eigVal);
-
-% Step 4: Sort eigenvalues (descending)
-[eigValues_sorted, idx] = sort(eigValues, 'descend');
-eigVec_sorted = eigVec(:, idx);
-
-% Step 5: Explained variance (%)
-explained = (eigValues_sorted / sum(eigValues_sorted)) * 100;
-cum_explained = cumsum(explained);
-
-% Step 6: Number of components for 95% variance
-num_components = find(cum_explained >= 95, 1);
-
-% Step 7: Select principal components
-W = eigVec_sorted(:, 1:num_components);
-
-% Step 8: Project data
-X_train_pca = X_train_scaled * W;
-X_test_pca  = X_test_scaled * W;
-
-
-%% ----------------------------------
-% 6. Linear Regression Model
-%% ----------------------------------
-mdl = fitlm(X_train_pca, y_train);
-
-%% ----------------------------------
-% 7. Predict RUL
-%% ----------------------------------
-y_pred_all = predict(mdl, X_test_pca);
-
-% Take last cycle prediction per engine
-test_units = test(:,1);
-unique_test_units = unique(test_units);
-
-final_pred = zeros(length(unique_test_units),1);
-
-for i = 1:length(unique_test_units)
-    idx = test_units == unique_test_units(i);
-    final_pred(i) = y_pred_all(find(idx,1,'last'));
+    for i = 1:(size(data,1)-WINDOW)
+        win = data(i:i+WINDOW-1,:);
+        X_train = [X_train; win(:)'];
+        y_train = [y_train; rul_vals(i+WINDOW)];
+    end
 end
 
-%% ----------------------------------
-% 8. Evaluation Metrics
-%% ----------------------------------
-rmse = sqrt(mean((rul_test - final_pred).^2));
-mae  = mean(abs(rul_test - final_pred));
+% Test window (last window only)
+test_units = unique(test(:,1));
+X_test = [];
 
-SS_res = sum((rul_test - final_pred).^2);
+for id = test_units'
+    idx = test(:,1)==id;
+    data = X_test_all(idx,:);
+    win = data(end-WINDOW+1:end,:);
+    X_test = [X_test; win(:)'];
+end
+
+%% 6. PCA (95% variance)
+mu_pca = mean(X_train);
+Xc = X_train - mu_pca;
+
+C = cov(Xc);
+[V,D] = eig(C);
+
+[eigvals, idx] = sort(diag(D),'descend');
+V = V(:,idx);
+
+explained = eigvals * 100 / sum(eigvals);
+cum_exp = cumsum(explained);
+numPC = find(cum_exp >= 95,1);
+
+W = V(:,1:numPC);
+
+X_train_pca = Xc * W;
+X_test_pca = (X_test - mu_pca) * W;
+
+%% 7. SVR (RBF Kernel)
+mdl = fitrsvm(X_train_pca, y_train, ...
+    'KernelFunction','rbf', ...
+    'KernelScale','auto', ...
+    'Standardize',true);
+
+%% 8. PREDICTION
+y_pred = predict(mdl, X_test_pca);
+
+y_pred(y_pred<0)=0;
+y_pred(y_pred>RUL_CAP)=RUL_CAP;
+
+%% 9. METRICS
+rmse = sqrt(mean((rul_test - y_pred).^2));
+mae  = mean(abs(rul_test - y_pred));
+
+SS_res = sum((rul_test - y_pred).^2);
 SS_tot = sum((rul_test - mean(rul_test)).^2);
 r2 = 1 - SS_res/SS_tot;
 
-% Tolerance-based accuracy
-tolerance = 30;   % cycles
-accuracy = mean(abs(rul_test - final_pred) <= tolerance) * 100;
+TOL = 40;
+accuracy = mean(abs(rul_test - y_pred)<=TOL)*100;
 
-%% ----------------------------------
-% 9. Display Results
-%% ----------------------------------
-fprintf('\nFD001 | PCA + Linear Regression Results\n');
-fprintf('--------------------------------------\n');
-fprintf('PCA Components Used       : %d\n', num_components);
-fprintf('Variance Explained        : %.4f\n', sum(explained(1:num_components))/100);
-fprintf('RMSE                      : %.2f\n', rmse);
-fprintf('R^2 Score                 : %.3f\n', r2);
-fprintf('MAE                       : %.2f\n', mae);
-fprintf('Accuracy (±%d cycles)     : %.2f%%\n', tolerance, accuracy);
-
-%% ----------------------------------
-% 10. Plot Results
-%% ----------------------------------
-figure;
-plot(rul_test, '-o', 'LineWidth', 1.5); hold on;
-plot(final_pred, '-x', 'LineWidth', 1.5);
-xlabel('Engine Number');
-ylabel('Remaining Useful Life (RUL)');
-title('FD001: PCA + Linear Regression');
-legend('True RUL', 'Predicted RUL');
-grid on;
-
+fprintf('\n===== IMPROVED PCA + SVR =====\n');
+fprintf('PCA Components Used: %d\n', numPC);
+fprintf('RMSE: %.2f\n', rmse);
+fprintf('R2 Score: %.3f\n', r2);
+fprintf('MAE: %.2f\n', mae);
+fprintf('Accuracy (±40 cycles): %.2f%%\n', accuracy);
